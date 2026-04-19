@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+# Secrets
+cookies.json
+www.tiktok.com_cookies.txt
+
+# Local outputs
+*.csv
+*.json
+*.log
+
+# Research docs / local source material
+*.pdf
