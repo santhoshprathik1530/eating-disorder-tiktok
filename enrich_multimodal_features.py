@@ -87,6 +87,21 @@ def parse_model_list(value: str, defaults: list[str]) -> list[str]:
     return models or list(defaults)
 
 
+def pricing_total(model: dict[str, Any], require_image_input: bool) -> float:
+    pricing = model.get("pricing", {}) or {}
+
+    def num(key: str) -> float:
+        try:
+            return float(pricing.get(key, "0") or 0.0)
+        except Exception:
+            return 0.0
+
+    total = num("prompt") + num("completion") + num("request")
+    if require_image_input:
+        total += num("image")
+    return total
+
+
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -827,16 +842,26 @@ def resolve_runtime_models(
             continue
         if not require_image_input and "text" not in input_modalities:
             continue
-        available.append(model_id)
+        available.append(model)
 
-    resolved = [model for model in preferred_models if model in available]
+    available_ids = [str(model.get("id", "")) for model in available]
+    resolved = [model for model in preferred_models if model in available_ids]
     if resolved:
         return resolved
 
-    free_available = [model for model in available if model.endswith(":free")]
-    if free_available:
-        return free_available[:5]
-    return available[:5] or preferred_models
+    paid_available = [
+        model for model in available if not str(model.get("id", "")).endswith(":free")
+    ]
+    free_available = [
+        model for model in available if str(model.get("id", "")).endswith(":free")
+    ]
+
+    paid_available.sort(key=lambda model: pricing_total(model, require_image_input))
+    free_available.sort(key=lambda model: pricing_total(model, require_image_input))
+
+    ranked = paid_available + free_available
+    ranked_ids = [str(model.get("id", "")) for model in ranked if model.get("id")]
+    return ranked_ids[:5] or preferred_models
 
 
 def call_openrouter_with_fallback(
