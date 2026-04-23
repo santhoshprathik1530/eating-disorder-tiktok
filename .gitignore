@@ -11,6 +11,13 @@ www.tiktok.com_cookies.txt
 *.csv
 *.json
 *.log
+top20_audio/
+top20_frames/
+top20_videos/
+testset_audio/
+testset_frames/
+testset_videos/
+old/
 
 # Research docs / local source material
 *.pdf

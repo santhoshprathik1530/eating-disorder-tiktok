@@ -1,23 +1,161 @@
-# TikTok Scraper
+# TikTok Eating-Disorder Signal Pipeline
 
-This repository contains the TikTok hashtag scraping workflow for the eating-disorder project.
+This repository contains the TikTok collection and feature-enrichment workflow for healthcare-oriented content-signal analysis. The pipeline does content analysis only; it does not diagnose creators.
 
-## Main files
+## Active Files
 
-- `tiktok_collect_range.py`: VM-ready range scraper with checkpointing, parallel workers, and a live dashboard.
-- `setup_tiktok_vm_ubuntu.sh`: Ubuntu VM setup script for Python, Playwright, and browser dependencies.
-- `tiktok_collect_2026.py`: earlier collector variant kept for reference.
+- `tiktok_collect_range.py`: VM-ready TikTok hashtag collector.
+- `build_testset_baseline.py`: builds the current cleaned test-set baseline CSV from TikTok metadata.
+- `enrich_multimodal_features.py`: downloads videos, transcribes audio, samples frames, summarizes visual/OCR content, and asks an LLM for signal labels.
+- `requirements.txt`: Python dependencies for local or VM runs.
+- `setup_tiktok_vm_ubuntu.sh`: Ubuntu VM setup helper for collection runs.
 
-## Typical VM run
+Older scripts are archived under `old/`.
+
+## Current Test Set
+
+The default test set includes every row from `tiktok_videos_2025_07_to_today.csv` where either `source_hashtag_query` or the actual `hashtags` column matches:
+
+- `whatieatinaday`
+- `whatieatinday`
+- `wieiad`
+
+Run:
 
 ```bash
-chmod +x setup_tiktok_vm_ubuntu.sh
-./setup_tiktok_vm_ubuntu.sh
-source .venv/bin/activate
-xvfb-run -a python tiktok_collect_range.py --start-date 2025-07-01 --end-date "$(date -u +%F)" --workers 3 --browser chromium
+python3 build_testset_baseline.py
+```
+
+By default this also cleans the test set before enrichment:
+
+- Removes duplicate `video_id` and duplicate `video_url` rows.
+- Keeps repeated-author videos.
+- Writes `testset_repeated_authors.csv` so creator clustering can be inspected.
+
+Default output:
+
+```text
+testset_baseline_features.csv
+testset_baseline_feature_summary.json
+```
+
+To cap the test set for a smaller run:
+
+```bash
+python3 build_testset_baseline.py --top-n 20
+```
+
+## Feature Levels
+
+Baseline features come only from the metadata CSV:
+
+```text
+video_id
+video_url
+created_at
+author_username
+source_hashtag_query
+matched_source_tags
+matched_actual_tags
+caption
+hashtags
+caption_word_count
+hashtag_count
+view_count
+like_count
+comment_count
+share_count
+like_rate
+comment_rate
+share_rate
+engagement_rate
+```
+
+Enrichment adds:
+
+```text
+comments_text
+comments_collected
+audio_transcript
+video_duration_seconds
+video_fps
+video_frame_total
+has_audio
+frame_count
+sampled_frame_timestamps
+frame_sampling_interval_seconds
+visual_frame_summary
+onscreen_text_ocr
+transcript_word_count
+ocr_word_count
+visual_food_quantity
+visual_body_checking_present
+visual_scale_present
+visual_before_after_present
+visual_exercise_present
+llm_signal_prediction_json
+llm_*_label
+llm_*_confidence
+llm_*_evidence
+human_*_label
+human_notes
+```
+
+Frames are sampled every 5 seconds by default. `--max-frames 0` samples the whole video, and `--max-vision-images 0` sends all sampled frames to the vision model.
+
+## Local or VM Setup
+
+```bash
+python3 -m pip install -U -r requirements.txt
+python3 -m playwright install chromium
+```
+
+Set your OpenRouter key before LLM calls:
+
+```bash
+export OPENROUTER_API_KEY="your_key_here"
+```
+
+Run the full enrichment:
+
+```bash
+python3 enrich_multimodal_features.py \
+  --download-videos \
+  --transcribe-audio \
+  --summarize-frames \
+  --predict-with-llm
+```
+
+Default outputs:
+
+```text
+testset_enriched_features.csv
+testset_enriched_features.json
+testset_videos/
+testset_audio/
+testset_frames/
+```
+
+## GCP VM One-Command Run
+
+After pushing/pulling the repo on the VM and placing local ignored files like the input CSV and cookies there:
+
+```bash
+gcloud compute ssh VM_NAME --zone ZONE --command '
+cd Eating-Disorder-Analysis &&
+python3 -m pip install -U -r requirements.txt &&
+python3 -m playwright install chromium &&
+export OPENROUTER_API_KEY="your_key_here" &&
+python3 build_testset_baseline.py &&
+python3 enrich_multimodal_features.py \
+  --download-videos \
+  --transcribe-audio \
+  --summarize-frames \
+  --predict-with-llm
+'
 ```
 
 ## Notes
 
-- Do not commit browser cookies or raw session exports.
-- CSV and JSON outputs are intentionally ignored by git.
+- Do not commit browser cookies, API keys, raw videos, transcripts, frame folders, CSV outputs, JSON outputs, or PDFs.
+- The `.gitignore` excludes local datasets and generated artifacts by default.

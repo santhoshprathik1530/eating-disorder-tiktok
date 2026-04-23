@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+"""Enrich top TikTok videos with comments, transcript, OCR, vision, and LLM labels.
+
+The script is designed to be incremental:
+
+1. It always reads the baseline feature CSV.
+2. It can optionally collect TikTok comments using TikTokApi + cookies.
+3. It can optionally download videos using the yt-dlp command if installed.
+4. It can optionally transcribe audio with OpenAI-compatible Whisper.
+5. It can optionally sample frames and send them to OpenRouter vision/LLM.
+
+Outputs are keyed by video_id so they can be joined to human labels later.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+import csv
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import requests
+
+
+COMMENT_FIELDS = [
+    "video_id",
+    "comment_id",
+    "comment_text",
+    "comment_like_count",
+    "comment_created_at",
+    "comment_author_username",
+    "comment_author_user_id",
+]
+
+SIGNALS = [
+    "restriction",
+    "binge_eating",
+    "rapid_weight_loss",
+    "body_dissatisfaction",
+    "purging_compensation",
+]
+
+HUMAN_LABEL_COLUMNS = [
+    "human_restriction_label",
+    "human_binge_eating_label",
+    "human_rapid_weight_loss_label",
+    "human_body_dissatisfaction_label",
+    "human_purging_compensation_label",
+    "human_notes",
+]
+
+
+def normalize_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def append_rows(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_cookie_map(cookie_file: Path) -> dict[str, str]:
+    raw = json.loads(cookie_file.read_text(encoding="utf-8"))
+    cookies = raw if isinstance(raw, list) else raw["cookies"]
+    cookie_map = {}
+    for cookie in cookies:
+        domain = str(cookie.get("domain", ""))
+        if "tiktok.com" not in domain:
+            continue
+        cookie_map[str(cookie["name"])] = str(cookie["value"])
+    if not cookie_map:
+        raise ValueError(f"No TikTok cookies found in {cookie_file}")
+    return cookie_map
+
+
+async def collect_comments_for_videos(
+    videos: pd.DataFrame,
+    cookie_file: Path,
+    output_csv: Path,
+    comments_per_video: int,
+    browser: str,
+    headless: bool,
+    min_sleep: float,
+    max_sleep: float,
+) -> None:
+    from TikTokApi import TikTokApi
+    from TikTokApi.exceptions import InvalidResponseException
+
+    cookie_map = load_cookie_map(cookie_file)
+    rows_to_skip = set()
+    if output_csv.exists():
+        previous = pd.read_csv(output_csv, dtype={"video_id": str})
+        rows_to_skip = set(previous["video_id"].dropna().astype(str))
+
+    async with TikTokApi() as api:
+        await api.create_sessions(
+            cookies=[cookie_map],
+            num_sessions=1,
+            headless=headless,
+            sleep_after=5,
+            browser=browser,
+        )
+        for _, row in videos.iterrows():
+            video_id = str(row["video_id"])
+            if video_id in rows_to_skip:
+                continue
+            pending = []
+            try:
+                async for comment in api.video(id=video_id).comments(count=comments_per_video):
+                    data = getattr(comment, "as_dict", {}) or {}
+                    user = data.get("user", {}) or {}
+                    pending.append(
+                        {
+                            "video_id": video_id,
+                            "comment_id": data.get("cid"),
+                            "comment_text": normalize_text(data.get("text")),
+                            "comment_like_count": data.get("digg_count"),
+                            "comment_created_at": data.get("create_time"),
+                            "comment_author_username": user.get("unique_id"),
+                            "comment_author_user_id": user.get("uid"),
+                        }
+                    )
+                    await asyncio.sleep(min_sleep)
+            except InvalidResponseException:
+                pass
+            except Exception as exc:
+                print(f"Comment collection failed for {video_id}: {exc}")
+            append_rows(output_csv, COMMENT_FIELDS, pending)
+            await asyncio.sleep(max_sleep)
+
+
+def aggregate_comments(comment_csv: Path, max_chars: int = 6000) -> pd.DataFrame:
+    if not comment_csv.exists():
+        return pd.DataFrame(columns=["video_id", "comments_text", "comments_collected"])
+    comments = pd.read_csv(comment_csv, dtype={"video_id": str}).fillna("")
+    if comments.empty:
+        return pd.DataFrame(columns=["video_id", "comments_text", "comments_collected"])
+    comments["comment_text"] = comments["comment_text"].map(normalize_text)
+    comments = comments[comments["comment_text"] != ""]
+    grouped = []
+    for video_id, group in comments.groupby("video_id"):
+        sorted_group = group.sort_values("comment_like_count", ascending=False)
+        texts = []
+        total = 0
+        for text in sorted_group["comment_text"].tolist():
+            if total + len(text) + 2 > max_chars:
+                break
+            texts.append(text)
+            total += len(text) + 2
+        grouped.append(
+            {
+                "video_id": str(video_id),
+                "comments_text": "\n".join(texts),
+                "comments_collected": int(len(group)),
+            }
+        )
+    return pd.DataFrame(grouped)
+
+
+def download_videos(videos: pd.DataFrame, video_dir: Path) -> None:
+    ensure_dir(video_dir)
+    yt_dlp_cmd = shutil.which("yt-dlp")
+    if yt_dlp_cmd is None:
+        try:
+            import yt_dlp  # noqa: F401
+
+            yt_dlp_cmd = None
+        except Exception:
+            print("yt-dlp is not installed; skipping video download.")
+            return
+    for _, row in videos.iterrows():
+        video_id = str(row["video_id"])
+        output_template = str(video_dir / f"{video_id}.%(ext)s")
+        existing = list(video_dir.glob(f"{video_id}.*"))
+        if existing:
+            continue
+        if yt_dlp_cmd:
+            cmd = [
+                yt_dlp_cmd,
+                "--no-playlist",
+                "--quiet",
+                "--no-warnings",
+                "-o",
+                output_template,
+                str(row["video_url"]),
+            ]
+        else:
+            cmd = [
+                "python3",
+                "-m",
+                "yt_dlp",
+                "--no-playlist",
+                "--quiet",
+                "--no-warnings",
+                "-o",
+                output_template,
+                str(row["video_url"]),
+            ]
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"Download failed for {video_id}: {exc}")
+
+
+def find_video_file(video_dir: Path, video_id: str) -> Path | None:
+    for suffix in [".mp4", ".webm", ".mkv", ".mov"]:
+        path = video_dir / f"{video_id}{suffix}"
+        if path.exists():
+            return path
+    matches = list(video_dir.glob(f"{video_id}.*"))
+    return matches[0] if matches else None
+
+
+def ffmpeg_executable() -> str | None:
+    ffmpeg_cmd = shutil.which("ffmpeg")
+    if ffmpeg_cmd:
+        return ffmpeg_cmd
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def get_media_info(video_path: Path) -> dict[str, Any]:
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+
+    duration = round(total_frames / fps, 3) if fps else 0.0
+    info = {
+        "video_duration_seconds": duration,
+        "video_fps": round(fps, 3) if fps else 0.0,
+        "video_frame_total": total_frames,
+        "has_audio": False,
+    }
+
+    ffmpeg_cmd = ffmpeg_executable()
+    if ffmpeg_cmd:
+        proc = subprocess.run(
+            [ffmpeg_cmd, "-i", str(video_path), "-hide_banner"],
+            capture_output=True,
+            text=True,
+        )
+        info["has_audio"] = "Audio:" in proc.stderr
+    return info
+
+
+def extract_audio(video_path: Path, audio_dir: Path) -> Path | None:
+    ensure_dir(audio_dir)
+    ffmpeg_cmd = ffmpeg_executable()
+    if ffmpeg_cmd is None:
+        print("ffmpeg is not installed; skipping audio extraction.")
+        return None
+    audio_path = audio_dir / f"{video_path.stem}.mp3"
+    if audio_path.exists():
+        return audio_path
+    cmd = [
+        ffmpeg_cmd,
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-q:a",
+        "4",
+        str(audio_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return audio_path
+    except subprocess.CalledProcessError:
+        print(f"Audio extraction failed for {video_path.name}")
+        return None
+
+
+def transcribe_audio_openai(audio_path: Path, model: str) -> str:
+    from openai import OpenAI
+
+    client = OpenAI()
+    with audio_path.open("rb") as f:
+        result = client.audio.transcriptions.create(model=model, file=f)
+    return normalize_text(getattr(result, "text", ""))
+
+
+def transcribe_media_faster_whisper(media_path: Path, model: str, device: str) -> str:
+    from faster_whisper import WhisperModel
+
+    compute_type = "int8" if device == "cpu" else "float16"
+    whisper = WhisperModel(model, device=device, compute_type=compute_type)
+    segments, _ = whisper.transcribe(str(media_path), vad_filter=True)
+    return normalize_text(" ".join(segment.text.strip() for segment in segments))
+
+
+def transcribe_with_local_fallback(
+    video_path: Path,
+    audio_dir: Path,
+    model: str,
+    device: str,
+) -> str:
+    try:
+        transcript = transcribe_media_faster_whisper(video_path, model, device)
+        if transcript:
+            return transcript
+    except Exception as exc:
+        print(f"Direct video transcription failed for {video_path.stem}: {exc}")
+
+    audio_path = extract_audio(video_path, audio_dir)
+    if not audio_path:
+        return ""
+    return transcribe_media_faster_whisper(audio_path, model, device)
+
+
+def sample_frames(video_path: Path, frame_dir: Path, every_seconds: float, max_frames: int) -> list[dict[str, Any]]:
+    import cv2
+
+    ensure_dir(frame_dir)
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if total_frames <= 0:
+        cap.release()
+        return []
+
+    duration = total_frames / fps
+    timestamps = []
+    current = 0.0
+    while current <= duration and (max_frames <= 0 or len(timestamps) < max_frames):
+        timestamps.append(current)
+        current += every_seconds
+
+    output_frames = []
+    for idx, seconds in enumerate(timestamps):
+        output = frame_dir / f"{video_path.stem}_frame_{idx:03d}_{int(seconds):04d}s.jpg"
+        if output.exists():
+            output_frames.append({"path": output, "timestamp_seconds": round(seconds, 3)})
+            continue
+        cap.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        cv2.imwrite(str(output), frame)
+        output_frames.append({"path": output, "timestamp_seconds": round(seconds, 3)})
+    cap.release()
+    return output_frames
+
+
+def image_to_data_url(path: Path) -> str:
+    encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def call_openrouter(messages: list[dict[str, Any]], model: str, temperature: float = 0.0) -> str:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set.")
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost",
+            "X-Title": "Eating Disorder TikTok Feature Extraction",
+        },
+        json={"model": model, "messages": messages, "temperature": temperature},
+        timeout=120,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def summarize_frames_openrouter(
+    frame_paths: list[Path],
+    caption: str,
+    model: str,
+    max_images: int,
+) -> dict[str, str]:
+    if not frame_paths:
+        return {"visual_frame_summary": "", "onscreen_text_ocr": ""}
+    selected = frame_paths if max_images <= 0 else frame_paths[:max_images]
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                f"Analyze all {len(selected)} sampled TikTok video frames together for "
+                "healthcare research on "
+                "disordered-eating content signals. Do not diagnose the creator. "
+                "Return compact JSON with keys visual_frame_summary and onscreen_text_ocr. "
+                "Mention visible calorie totals, body checking, scale images, before/after "
+                "claims, food quantity, or compensatory exercise if present. "
+                "If the same overlay text appears repeatedly, deduplicate it. "
+                f"Caption context: {caption[:1500]}"
+            ),
+        }
+    ]
+    for path in selected:
+        content.append({"type": "image_url", "image_url": {"url": image_to_data_url(path)}})
+    raw = call_openrouter([{"role": "user", "content": content}], model=model)
+    try:
+        parsed = json.loads(extract_json(raw))
+        return {
+            "visual_frame_summary": normalize_text(parsed.get("visual_frame_summary")),
+            "onscreen_text_ocr": normalize_text(parsed.get("onscreen_text_ocr")),
+        }
+    except Exception:
+        return {"visual_frame_summary": normalize_text(raw), "onscreen_text_ocr": ""}
+
+
+def extract_json(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def llm_signal_prediction(row: pd.Series, model: str) -> dict[str, Any]:
+    prompt = {
+        "task": (
+            "Classify whether this TikTok contains content signals related to "
+            "disordered eating. This is content analysis only, not a diagnosis."
+        ),
+        "signals": SIGNALS,
+        "output_schema": {
+            signal: {
+                "label": "yes/no/uncertain",
+                "confidence": "0.0-1.0",
+                "evidence": "short quote or observation",
+            }
+            for signal in SIGNALS
+        }
+        | {
+            "recovery_or_educational_context": "yes/no/uncertain",
+            "overall_notes": "brief explanation",
+        },
+        "video": {
+            "video_id": row.get("video_id", ""),
+            "caption": row.get("caption", ""),
+            "hashtags": row.get("hashtags", ""),
+            "metadata": {
+                "views": row.get("view_count", ""),
+                "likes": row.get("like_count", ""),
+                "comments": row.get("comment_count", ""),
+                "shares": row.get("share_count", ""),
+            },
+            "comments_text": row.get("comments_text", ""),
+            "audio_transcript": row.get("audio_transcript", ""),
+            "onscreen_text_ocr": row.get("onscreen_text_ocr", ""),
+            "visual_frame_summary": row.get("visual_frame_summary", ""),
+        },
+    }
+    raw = call_openrouter(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "You are a careful healthcare content-analysis assistant. "
+                    "Use only evidence in the provided data. Avoid diagnosing people."
+                ),
+            },
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        model=model,
+    )
+    try:
+        parsed = json.loads(extract_json(raw))
+    except Exception:
+        parsed = {"raw_response": raw}
+    return {"llm_signal_prediction_json": json.dumps(parsed, ensure_ascii=False)}
+
+
+def text_word_count(value: Any) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z]+)?", normalize_text(value)))
+
+
+def infer_visual_flags(summary: Any, ocr_text: Any) -> dict[str, bool]:
+    text = f"{normalize_text(summary)} {normalize_text(ocr_text)}".lower()
+    return {
+        "visual_food_quantity": any(
+            term in text
+            for term in [
+                "large amount",
+                "small portion",
+                "tiny portion",
+                "food quantity",
+                "multiple dishes",
+                "plate",
+                "meal",
+            ]
+        ),
+        "visual_body_checking_present": any(
+            term in text for term in ["body checking", "body check", "mirror selfie", "body-focused"]
+        ),
+        "visual_scale_present": any(term in text for term in ["scale", "weigh-in", "weight display"]),
+        "visual_before_after_present": any(term in text for term in ["before/after", "before and after"]),
+        "visual_exercise_present": any(
+            term in text for term in ["exercise", "workout", "gym", "running", "cardio"]
+        ),
+    }
+
+
+def parse_llm_prediction(value: Any) -> dict[str, str]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except Exception:
+        return {}
+
+    if "raw_response" in parsed:
+        return parse_markdown_prediction_table(str(parsed["raw_response"]))
+
+    output: dict[str, str] = {}
+    for signal in SIGNALS:
+        item = parsed.get(signal, {})
+        if isinstance(item, dict):
+            output[f"llm_{signal}_label"] = normalize_text(item.get("label"))
+            output[f"llm_{signal}_confidence"] = normalize_text(item.get("confidence"))
+            output[f"llm_{signal}_evidence"] = normalize_text(item.get("evidence"))
+    output["llm_recovery_or_educational_context"] = normalize_text(
+        parsed.get("recovery_or_educational_context")
+    )
+    output["llm_overall_notes"] = normalize_text(parsed.get("overall_notes"))
+    return output
+
+
+def parse_markdown_prediction_table(raw: str) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip().strip("“”\"") for cell in stripped.strip("|").split("|")]
+        if len(cells) < 4 or cells[0].lower() in {"signal", "--------"}:
+            continue
+        signal = cells[0].lower().replace(" ", "_").replace("-", "_")
+        if signal in SIGNALS:
+            output[f"llm_{signal}_label"] = cells[1].lower()
+            output[f"llm_{signal}_confidence"] = cells[2]
+            output[f"llm_{signal}_evidence"] = cells[3]
+        elif signal == "recovery_or_educational_context":
+            output["llm_recovery_or_educational_context"] = cells[1].lower()
+
+    notes_match = re.search(r"\*\*Overall Notes\*\*\s*(.*)", raw, flags=re.I | re.S)
+    if notes_match:
+        output["llm_overall_notes"] = normalize_text(notes_match.group(1))
+    return output
+
+
+def add_parsed_llm_columns(enriched: pd.DataFrame) -> pd.DataFrame:
+    parsed_rows = [
+        parse_llm_prediction(value)
+        for value in enriched.get("llm_signal_prediction_json", pd.Series([""] * len(enriched)))
+    ]
+    parsed_df = pd.DataFrame(parsed_rows).fillna("")
+    for signal in SIGNALS:
+        for field in ["label", "confidence", "evidence"]:
+            col = f"llm_{signal}_{field}"
+            if col not in parsed_df.columns:
+                parsed_df[col] = ""
+    for col in ["llm_recovery_or_educational_context", "llm_overall_notes"]:
+        if col not in parsed_df.columns:
+            parsed_df[col] = ""
+
+    existing_cols = [col for col in parsed_df.columns if col in enriched.columns]
+    if existing_cols:
+        enriched = enriched.drop(columns=existing_cols)
+    return pd.concat([enriched.reset_index(drop=True), parsed_df.reset_index(drop=True)], axis=1)
+
+
+def enrich_rows(args: argparse.Namespace) -> pd.DataFrame:
+    baseline = pd.read_csv(args.input_features, dtype={"video_id": str}).fillna("")
+    comments = aggregate_comments(Path(args.comments_csv))
+    enriched = baseline.merge(comments, on="video_id", how="left").fillna("")
+    if "comments_collected" not in enriched.columns:
+        enriched["comments_collected"] = 0
+
+    ensure_dir(Path(args.video_dir))
+    ensure_dir(Path(args.audio_dir))
+    ensure_dir(Path(args.frame_dir))
+
+    audio_transcripts: dict[str, str] = {}
+    visual_summaries: dict[str, dict[str, str]] = {}
+    media_infos: dict[str, dict[str, Any]] = {}
+    frame_infos: dict[str, dict[str, Any]] = {}
+
+    if args.download_videos:
+        download_videos(enriched, Path(args.video_dir))
+
+    for _, row in enriched.iterrows():
+        video_id = str(row["video_id"])
+        video_path = find_video_file(Path(args.video_dir), video_id)
+        if not video_path:
+            audio_transcripts[video_id] = ""
+            visual_summaries[video_id] = {"visual_frame_summary": "", "onscreen_text_ocr": ""}
+            media_infos[video_id] = {
+                "video_duration_seconds": 0.0,
+                "video_fps": 0.0,
+                "video_frame_total": 0,
+                "has_audio": False,
+            }
+            frame_infos[video_id] = {
+                "frame_count": 0,
+                "sampled_frame_timestamps": "",
+                "frame_sampling_interval_seconds": args.frame_every_seconds,
+            }
+            continue
+
+        media_infos[video_id] = get_media_info(video_path)
+
+        if args.transcribe_audio:
+            transcript_path = Path(args.audio_dir) / f"{video_id}.transcript.txt"
+            if transcript_path.exists() and transcript_path.read_text(encoding="utf-8").strip():
+                audio_transcripts[video_id] = transcript_path.read_text(encoding="utf-8")
+            else:
+                try:
+                    if args.transcription_backend == "faster-whisper":
+                        transcript = transcribe_with_local_fallback(
+                            video_path,
+                            Path(args.audio_dir),
+                            args.faster_whisper_model,
+                            args.faster_whisper_device,
+                        )
+                    else:
+                        audio_path = extract_audio(video_path, Path(args.audio_dir))
+                        transcript = (
+                            transcribe_audio_openai(audio_path, args.whisper_model)
+                            if audio_path
+                            else ""
+                        )
+                    transcript_path.write_text(transcript, encoding="utf-8")
+                    audio_transcripts[video_id] = transcript
+                except Exception as exc:
+                    print(f"Transcription failed for {video_id}: {exc}")
+                    audio_transcripts[video_id] = ""
+
+        if args.summarize_frames:
+            video_frame_dir = Path(args.frame_dir) / video_id
+            sampled_frames = sample_frames(
+                video_path, video_frame_dir, args.frame_every_seconds, args.max_frames
+            )
+            frames = [frame["path"] for frame in sampled_frames]
+            timestamps = [str(frame["timestamp_seconds"]) for frame in sampled_frames]
+            frame_infos[video_id] = {
+                "frame_count": len(sampled_frames),
+                "sampled_frame_timestamps": ";".join(timestamps),
+                "frame_sampling_interval_seconds": args.frame_every_seconds,
+            }
+            interval_label = str(args.frame_every_seconds).replace(".", "p")
+            image_cap_label = "all" if args.max_vision_images <= 0 else str(args.max_vision_images)
+            summary_path = video_frame_dir / (
+                f"vision_summary_every_{interval_label}s_images_{image_cap_label}.json"
+            )
+            if summary_path.exists():
+                visual_summaries[video_id] = json.loads(summary_path.read_text(encoding="utf-8"))
+            else:
+                try:
+                    summary = summarize_frames_openrouter(
+                        frames,
+                        str(row.get("caption", "")),
+                        args.vision_model,
+                        args.max_vision_images,
+                    )
+                    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+                    visual_summaries[video_id] = summary
+                    time.sleep(args.api_sleep)
+                except Exception as exc:
+                    print(f"Vision summary failed for {video_id}: {exc}")
+                    visual_summaries[video_id] = {"visual_frame_summary": "", "onscreen_text_ocr": ""}
+        else:
+            frame_infos[video_id] = {
+                "frame_count": 0,
+                "sampled_frame_timestamps": "",
+                "frame_sampling_interval_seconds": args.frame_every_seconds,
+            }
+
+    enriched["audio_transcript"] = enriched["video_id"].map(audio_transcripts).fillna("")
+    enriched["video_duration_seconds"] = enriched["video_id"].map(
+        lambda video_id: media_infos.get(str(video_id), {}).get("video_duration_seconds", 0.0)
+    )
+    enriched["video_fps"] = enriched["video_id"].map(
+        lambda video_id: media_infos.get(str(video_id), {}).get("video_fps", 0.0)
+    )
+    enriched["video_frame_total"] = enriched["video_id"].map(
+        lambda video_id: media_infos.get(str(video_id), {}).get("video_frame_total", 0)
+    )
+    enriched["has_audio"] = enriched["video_id"].map(
+        lambda video_id: media_infos.get(str(video_id), {}).get("has_audio", False)
+    )
+    enriched["frame_count"] = enriched["video_id"].map(
+        lambda video_id: frame_infos.get(str(video_id), {}).get("frame_count", 0)
+    )
+    enriched["sampled_frame_timestamps"] = enriched["video_id"].map(
+        lambda video_id: frame_infos.get(str(video_id), {}).get("sampled_frame_timestamps", "")
+    )
+    enriched["frame_sampling_interval_seconds"] = enriched["video_id"].map(
+        lambda video_id: frame_infos.get(str(video_id), {}).get(
+            "frame_sampling_interval_seconds", args.frame_every_seconds
+        )
+    )
+    enriched["visual_frame_summary"] = enriched["video_id"].map(
+        lambda video_id: visual_summaries.get(str(video_id), {}).get("visual_frame_summary", "")
+    )
+    enriched["onscreen_text_ocr"] = enriched["video_id"].map(
+        lambda video_id: visual_summaries.get(str(video_id), {}).get("onscreen_text_ocr", "")
+    )
+    enriched["transcript_word_count"] = enriched["audio_transcript"].map(text_word_count)
+    enriched["ocr_word_count"] = enriched["onscreen_text_ocr"].map(text_word_count)
+
+    visual_flags = [
+        infer_visual_flags(row.get("visual_frame_summary", ""), row.get("onscreen_text_ocr", ""))
+        for _, row in enriched.iterrows()
+    ]
+    visual_flags_df = pd.DataFrame(visual_flags)
+    enriched = pd.concat([enriched.reset_index(drop=True), visual_flags_df.reset_index(drop=True)], axis=1)
+
+    if args.predict_with_llm:
+        predictions = []
+        for _, row in enriched.iterrows():
+            try:
+                predictions.append(llm_signal_prediction(row, args.llm_model))
+                time.sleep(args.api_sleep)
+            except Exception as exc:
+                print(f"LLM prediction failed for {row['video_id']}: {exc}")
+                predictions.append({"llm_signal_prediction_json": ""})
+        enriched["llm_signal_prediction_json"] = [
+            prediction["llm_signal_prediction_json"] for prediction in predictions
+        ]
+    else:
+        enriched["llm_signal_prediction_json"] = ""
+
+    enriched = add_parsed_llm_columns(enriched)
+    for column in HUMAN_LABEL_COLUMNS:
+        if column not in enriched.columns:
+            enriched[column] = ""
+    return enriched
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-features", default="testset_baseline_features.csv")
+    parser.add_argument("--output-csv", default="testset_enriched_features.csv")
+    parser.add_argument("--output-json", default="testset_enriched_features.json")
+    parser.add_argument("--comments-csv", default="testset_comments.csv")
+    parser.add_argument("--cookie-file", default="cookies.json")
+    parser.add_argument("--comments-per-video", type=int, default=30)
+    parser.add_argument("--collect-comments", action="store_true")
+    parser.add_argument("--browser", default="chromium", choices=["chromium", "webkit", "firefox"])
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--min-sleep", type=float, default=1.2)
+    parser.add_argument("--max-sleep", type=float, default=3.0)
+    parser.add_argument("--download-videos", action="store_true")
+    parser.add_argument("--video-dir", default="testset_videos")
+    parser.add_argument("--audio-dir", default="testset_audio")
+    parser.add_argument("--frame-dir", default="testset_frames")
+    parser.add_argument("--transcribe-audio", action="store_true")
+    parser.add_argument(
+        "--transcription-backend",
+        default="faster-whisper",
+        choices=["faster-whisper", "openai"],
+    )
+    parser.add_argument("--faster-whisper-model", default="base")
+    parser.add_argument("--faster-whisper-device", default="cpu", choices=["cpu", "cuda", "auto"])
+    parser.add_argument("--whisper-model", default="whisper-1")
+    parser.add_argument("--summarize-frames", action="store_true")
+    parser.add_argument("--vision-model", default="nvidia/nemotron-nano-12b-v2-vl:free")
+    parser.add_argument("--frame-every-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help="Maximum sampled frames per video. 0 means sample the whole video.",
+    )
+    parser.add_argument(
+        "--max-vision-images",
+        type=int,
+        default=0,
+        help="Maximum frames sent together to the vision model. 0 means send all sampled frames.",
+    )
+    parser.add_argument("--predict-with-llm", action="store_true")
+    parser.add_argument("--llm-model", default="openai/gpt-oss-20b:free")
+    parser.add_argument("--api-sleep", type=float, default=1.0)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    baseline = pd.read_csv(args.input_features, dtype={"video_id": str}).fillna("")
+
+    if args.collect_comments:
+        asyncio.run(
+            collect_comments_for_videos(
+                baseline,
+                Path(args.cookie_file),
+                Path(args.comments_csv),
+                args.comments_per_video,
+                args.browser,
+                args.headless,
+                args.min_sleep,
+                args.max_sleep,
+            )
+        )
+
+    enriched = enrich_rows(args)
+    enriched.to_csv(args.output_csv, index=False)
+    Path(args.output_json).write_text(
+        json.dumps(enriched.to_dict(orient="records"), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"Wrote {len(enriched)} rows to {args.output_csv}")
+    print(f"Wrote JSON to {args.output_json}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+pandas
+requests
+opencv-python
+faster-whisper
+yt-dlp
+imageio-ffmpeg
+TikTokApi
+playwright
