@@ -228,6 +228,46 @@ http://VM_EXTERNAL_IP:8000/pipeline_dashboard.html
 
 The baseline step filters to the 3 selected hashtags: `whatieatinaday`, `whatieatinday`, and `wieiad`. If the VM runs out of RAM during local Whisper transcription, rerun enrichment with `--workers 2`.
 
+## Download Blocked Videos Locally
+
+If TikTok blocks some videos from the GCP VM IP, the VM run writes:
+
+```text
+failed_downloads.csv
+```
+
+Copy that manifest from VM to your local machine:
+
+```bash
+gcloud compute scp VM_NAME:~/eating-disorder-tiktok/failed_downloads.csv . --zone ZONE
+```
+
+On your local machine, download only those failed videos:
+
+```bash
+python download_failed_videos.py \
+  --failed-csv failed_downloads.csv \
+  --video-dir testset_videos \
+  --cookies www.tiktok.com_cookies.txt
+```
+
+Copy the downloaded videos back to the VM:
+
+```bash
+gcloud compute scp --recurse testset_videos VM_NAME:~/eating-disorder-tiktok/ --zone ZONE
+```
+
+Then rerun enrichment on the VM without the download stage:
+
+```bash
+python enrich_multimodal_features.py \
+  --transcribe-audio \
+  --summarize-frames \
+  --predict-with-llm \
+  --workers 4 \
+  --max-vision-images 10
+```
+
 ## Notes
 
 - Do not commit browser cookies, API keys, raw videos, transcripts, frame folders, CSV outputs, JSON outputs, or PDFs.

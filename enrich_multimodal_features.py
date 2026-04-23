@@ -424,7 +424,7 @@ def download_video(
     row: dict[str, Any],
     video_dir: Path,
     yt_dlp_cookie_file: Path | None,
-) -> None:
+) -> dict[str, Any]:
     yt_dlp_cmd = shutil.which("yt-dlp")
     if yt_dlp_cmd is None:
         try:
@@ -433,12 +433,22 @@ def download_video(
             yt_dlp_cmd = None
         except Exception:
             print("yt-dlp is not installed; skipping video download.")
-            return
+            return {
+                "video_id": str(row.get("video_id", "")),
+                "video_url": str(row.get("video_url", "")),
+                "status": "failed",
+                "error": "yt-dlp is not installed",
+            }
     video_id = str(row["video_id"])
     output_template = str(video_dir / f"{video_id}.%(ext)s")
     existing = list(video_dir.glob(f"{video_id}.*"))
     if existing:
-        return
+        return {
+            "video_id": video_id,
+            "video_url": str(row.get("video_url", "")),
+            "status": "exists",
+            "error": "",
+        }
     if yt_dlp_cmd:
         cmd = [
             yt_dlp_cmd,
@@ -466,8 +476,20 @@ def download_video(
         cmd[insert_at:insert_at] = ["--cookies", str(yt_dlp_cookie_file)]
     try:
         subprocess.run(cmd, check=True)
+        return {
+            "video_id": video_id,
+            "video_url": str(row.get("video_url", "")),
+            "status": "downloaded",
+            "error": "",
+        }
     except subprocess.CalledProcessError as exc:
         print(f"Download failed for {video_id}: {exc}")
+        return {
+            "video_id": video_id,
+            "video_url": str(row.get("video_url", "")),
+            "status": "failed",
+            "error": str(exc),
+        }
 
 
 def download_videos(
@@ -475,10 +497,12 @@ def download_videos(
     video_dir: Path,
     workers: int,
     yt_dlp_cookie_file: Path | None,
+    failed_downloads_csv: Path,
     tracker: ProgressTracker,
 ) -> None:
     ensure_dir(video_dir)
     rows = [row.to_dict() for _, row in videos.iterrows()]
+    failed_rows = []
     tracker.start_stage("download", len(rows))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_video_id = {
@@ -489,11 +513,27 @@ def download_videos(
             video_id = future_to_video_id[future]
             tracker.active("download", video_id)
             try:
-                future.result()
-                tracker.increment("download")
+                result = future.result()
+                failed = result.get("status") == "failed"
+                if failed:
+                    failed_rows.append(result)
+                tracker.increment("download", error=failed)
             except Exception as exc:
                 print(f"Download failed for {video_id}: {exc}")
+                failed_rows.append(
+                    {
+                        "video_id": video_id,
+                        "video_url": "",
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
                 tracker.increment("download", error=True)
+    if failed_rows:
+        pd.DataFrame(failed_rows).to_csv(failed_downloads_csv, index=False)
+        print(f"Wrote failed downloads to {failed_downloads_csv}")
+    elif failed_downloads_csv.exists():
+        failed_downloads_csv.unlink()
     tracker.finish_stage("download")
 
 
@@ -1063,6 +1103,7 @@ def enrich_rows(args: argparse.Namespace, tracker: ProgressTracker) -> pd.DataFr
             Path(args.video_dir),
             args.workers,
             yt_dlp_cookie_file,
+            Path(args.failed_downloads_csv),
             tracker,
         )
     else:
@@ -1135,6 +1176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", default="testset_enriched_features.json")
     parser.add_argument("--progress-json", default="pipeline_progress.json")
     parser.add_argument("--dashboard-html", default="pipeline_dashboard.html")
+    parser.add_argument("--failed-downloads-csv", default="failed_downloads.csv")
     parser.add_argument("--comments-csv", default="testset_comments.csv")
     parser.add_argument("--cookie-file", default="cookies.json")
     parser.add_argument(
