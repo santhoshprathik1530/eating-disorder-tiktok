@@ -800,6 +800,45 @@ def call_openrouter(messages: list[dict[str, Any]], model: str, temperature: flo
     return data["choices"][0]["message"]["content"]
 
 
+def fetch_openrouter_models() -> list[dict[str, Any]]:
+    response = requests.get("https://openrouter.ai/api/v1/models", timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    return data.get("data", [])
+
+
+def resolve_runtime_models(
+    preferred_models: list[str],
+    *,
+    require_image_input: bool,
+) -> list[str]:
+    try:
+        models = fetch_openrouter_models()
+    except Exception as exc:
+        print(f"Could not fetch OpenRouter models list; using configured models: {exc}")
+        return preferred_models
+
+    available = []
+    for model in models:
+        model_id = str(model.get("id", ""))
+        architecture = model.get("architecture", {}) or {}
+        input_modalities = architecture.get("input_modalities", []) or []
+        if require_image_input and "image" not in input_modalities:
+            continue
+        if not require_image_input and "text" not in input_modalities:
+            continue
+        available.append(model_id)
+
+    resolved = [model for model in preferred_models if model in available]
+    if resolved:
+        return resolved
+
+    free_available = [model for model in available if model.endswith(":free")]
+    if free_available:
+        return free_available[:5]
+    return available[:5] or preferred_models
+
+
 def call_openrouter_with_fallback(
     messages: list[dict[str, Any]],
     models: list[str],
@@ -1160,6 +1199,8 @@ def run_enrichment_jobs(
     rows = [row.to_dict() for _, row in enriched.iterrows()]
     results = []
     api_rate_limiter = ApiRateLimiter(args.api_sleep)
+    args.vision_models = resolve_runtime_models(args.vision_models, require_image_input=True)
+    print(f"Vision model candidates: {', '.join(args.vision_models)}")
     tracker.start_stage("enrich", len(rows))
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_video_id = {
@@ -1197,6 +1238,8 @@ def run_llm_predictions(
     rows = [row for _, row in enriched.iterrows()]
     predictions = [""] * len(rows)
     api_rate_limiter = ApiRateLimiter(args.api_sleep)
+    args.llm_models = resolve_runtime_models(args.llm_models, require_image_input=False)
+    print(f"LLM model candidates: {', '.join(args.llm_models)}")
     tracker.start_stage("llm", len(rows))
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_index = {

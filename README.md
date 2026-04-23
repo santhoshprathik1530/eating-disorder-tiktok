@@ -220,6 +220,8 @@ If OpenRouter rate-limits the VM, increase `--api-sleep` to `3` or `5`. The scri
 
 The script also accepts comma-separated fallback model lists. If one OpenRouter model is rate-limited or unavailable, it automatically tries the next one.
 
+Before those calls run, the script also queries OpenRouter's current models catalog and keeps only model IDs that are actually available at that moment. If none of your preferred models are live, it falls back to currently available compatible models.
+
 Example:
 
 ```bash
