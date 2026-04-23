@@ -91,20 +91,39 @@ def percent(done: int, total: int) -> float:
 
 def build_dashboard_html(progress: dict[str, Any]) -> str:
     stages = progress.get("stages", {})
+    pipeline_order = ["comments", "download", "enrich", "llm", "write_outputs"]
+    stage_cards = []
     rows = []
-    for name, stage in stages.items():
+    for name in pipeline_order:
+        stage = stages.get(name, {})
         total = int(stage.get("total", 0))
         completed = int(stage.get("completed", 0))
+        running = int(stage.get("running", 0))
+        errors = int(stage.get("errors", 0))
+        queued = max(total - completed - running, 0)
         pct = percent(completed, total)
+        status = stage.get("status", "pending")
+        stage_cards.append(
+            f"""
+            <div class="stage {status}">
+              <div class="stage-name">{name.replace('_', ' ').title()}</div>
+              <div class="stage-status">{status}</div>
+              <div class="bar"><span style="width:{pct}%"></span></div>
+              <div class="stage-meta">{completed}/{total} done</div>
+              <div class="stage-sub">running {running} | queued {queued} | errors {errors}</div>
+            </div>
+            """
+        )
         rows.append(
             f"""
             <tr>
               <td>{name}</td>
-              <td>{stage.get("status", "pending")}</td>
+              <td>{status}</td>
               <td>{completed}/{total}</td>
+              <td>{running}</td>
+              <td>{queued}</td>
+              <td>{errors}</td>
               <td><div class="bar"><span style="width:{pct}%"></span></div></td>
-              <td>{pct}%</td>
-              <td>{stage.get("errors", 0)}</td>
             </tr>
             """
         )
@@ -130,6 +149,7 @@ def build_dashboard_html(progress: dict[str, Any]) -> str:
       --good: #4ade80;
       --warn: #fbbf24;
       --accent: #67e8f9;
+      --bad: #f87171;
     }}
     body {{
       margin: 0;
@@ -157,6 +177,26 @@ def build_dashboard_html(progress: dict[str, Any]) -> str:
       box-shadow: 0 18px 40px rgba(0,0,0,.24);
     }}
     .metric {{ font-size: 34px; font-weight: 800; color: var(--good); }}
+    .pipeline {{
+      display: grid;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 12px;
+      margin: 18px 0 22px;
+    }}
+    .stage {{
+      background: rgba(16,24,39,.96);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      position: relative;
+    }}
+    .stage.running {{ border-color: var(--accent); box-shadow: 0 0 0 1px rgba(103,232,249,.25) inset; }}
+    .stage.done {{ border-color: rgba(74,222,128,.45); }}
+    .stage.skipped {{ border-color: rgba(148,163,184,.35); opacity: .8; }}
+    .stage-name {{ font-size: 14px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); }}
+    .stage-status {{ font-size: 26px; font-weight: 800; margin: 10px 0 12px; }}
+    .stage-meta {{ margin-top: 10px; font-weight: 700; }}
+    .stage-sub {{ margin-top: 6px; color: var(--muted); font-size: 13px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; }}
     th {{ color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
@@ -164,7 +204,8 @@ def build_dashboard_html(progress: dict[str, Any]) -> str:
     .bar {{ height: 10px; min-width: 150px; background: #1e293b; border-radius: 999px; overflow: hidden; }}
     .bar span {{ display: block; height: 100%; background: linear-gradient(90deg, var(--good), var(--accent)); }}
     .two {{ display: grid; grid-template-columns: 1.4fr .8fr; gap: 16px; }}
-    @media (max-width: 900px) {{ .two {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 1100px) {{ .pipeline {{ grid-template-columns: repeat(2, 1fr); }} }}
+    @media (max-width: 900px) {{ .two {{ grid-template-columns: 1fr; }} .pipeline {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
@@ -178,11 +219,18 @@ def build_dashboard_html(progress: dict[str, Any]) -> str:
     <div class="card"><div class="muted">Status</div><div class="metric">{progress.get("status", "running")}</div></div>
   </div>
 
+  <div class="card">
+    <h2>Pipeline</h2>
+    <div class="muted">Flow: comments -> downloads -> media enrichment -> llm labels -> outputs</div>
+    <div class="pipeline">{''.join(stage_cards)}</div>
+    <div class="muted">API spacing: <code>{progress.get("api_sleep_seconds", 0)}</code> seconds between OpenRouter requests</div>
+  </div>
+
   <div class="two">
     <div class="card">
       <h2>Stages</h2>
       <table>
-        <thead><tr><th>Stage</th><th>Status</th><th>Done</th><th>Progress</th><th>%</th><th>Errors</th></tr></thead>
+        <thead><tr><th>Stage</th><th>Status</th><th>Done</th><th>Running</th><th>Queued</th><th>Errors</th><th>Progress</th></tr></thead>
         <tbody>{''.join(rows)}</tbody>
       </table>
     </div>
@@ -216,16 +264,17 @@ class ProgressTracker:
             "current_stage": "starting",
             "total_rows": total_rows,
             "workers": args.workers,
+            "api_sleep_seconds": args.api_sleep,
             "input_features": args.input_features,
             "output_csv": args.output_csv,
             "output_json": args.output_json,
             "active_items": {},
             "stages": {
-                "comments": {"status": "skipped", "total": 0, "completed": 0, "errors": 0},
-                "download": {"status": "pending", "total": 0, "completed": 0, "errors": 0},
-                "enrich": {"status": "pending", "total": total_rows, "completed": 0, "errors": 0},
-                "llm": {"status": "pending", "total": 0, "completed": 0, "errors": 0},
-                "write_outputs": {"status": "pending", "total": 2, "completed": 0, "errors": 0},
+                "comments": {"status": "skipped", "total": 0, "completed": 0, "running": 0, "errors": 0},
+                "download": {"status": "pending", "total": 0, "completed": 0, "running": 0, "errors": 0},
+                "enrich": {"status": "pending", "total": total_rows, "completed": 0, "running": 0, "errors": 0},
+                "llm": {"status": "pending", "total": 0, "completed": 0, "running": 0, "errors": 0},
+                "write_outputs": {"status": "pending", "total": 2, "completed": 0, "running": 0, "errors": 0},
             },
         }
         self.write()
@@ -240,6 +289,7 @@ class ProgressTracker:
             self.progress["current_stage"] = stage
             item = self.progress["stages"][stage]
             item["status"] = "running"
+            item["running"] = 0
             if total is not None:
                 item["total"] = total
             self.write()
@@ -247,12 +297,14 @@ class ProgressTracker:
     def finish_stage(self, stage: str) -> None:
         with self.lock:
             self.progress["stages"][stage]["status"] = "done"
+            self.progress["stages"][stage]["running"] = 0
             self.progress["active_items"].pop(stage, None)
             self.write()
 
     def skip_stage(self, stage: str) -> None:
         with self.lock:
             self.progress["stages"][stage]["status"] = "skipped"
+            self.progress["stages"][stage]["running"] = 0
             self.progress["active_items"].pop(stage, None)
             self.write()
 
@@ -268,8 +320,10 @@ class ProgressTracker:
         with self.lock:
             if video_id:
                 self.progress["active_items"][stage] = video_id
+                self.progress["stages"][stage]["running"] = 1
             else:
                 self.progress["active_items"].pop(stage, None)
+                self.progress["stages"][stage]["running"] = 0
             self.write()
 
     def done(self) -> None:
@@ -278,7 +332,26 @@ class ProgressTracker:
             self.progress["current_stage"] = "complete"
             self.progress["finished_at"] = utc_now_iso()
             self.progress["active_items"] = {}
+            for stage in self.progress["stages"].values():
+                stage["running"] = 0
             self.write()
+
+
+class ApiRateLimiter:
+    def __init__(self, min_interval_seconds: float) -> None:
+        self.min_interval_seconds = max(float(min_interval_seconds), 0.0)
+        self.lock = threading.Lock()
+        self.next_allowed_at = 0.0
+
+    def wait(self) -> None:
+        if self.min_interval_seconds <= 0:
+            return
+        with self.lock:
+            now = time.monotonic()
+            wait_for = max(0.0, self.next_allowed_at - now)
+            self.next_allowed_at = max(self.next_allowed_at, now) + self.min_interval_seconds
+        if wait_for > 0:
+            time.sleep(wait_for)
 
 
 def load_cookie_map(cookie_file: Path) -> dict[str, str]:
@@ -715,9 +788,12 @@ def summarize_frames_openrouter(
     caption: str,
     model: str,
     max_images: int,
+    rate_limiter: ApiRateLimiter | None = None,
 ) -> dict[str, str]:
     if not frame_paths:
         return {"visual_frame_summary": "", "onscreen_text_ocr": ""}
+    if rate_limiter:
+        rate_limiter.wait()
     selected = frame_paths if max_images <= 0 else frame_paths[:max_images]
     content: list[dict[str, Any]] = [
         {
@@ -759,7 +835,13 @@ def extract_json(text: str) -> str:
     return text
 
 
-def llm_signal_prediction(row: pd.Series, model: str) -> dict[str, Any]:
+def llm_signal_prediction(
+    row: pd.Series,
+    model: str,
+    rate_limiter: ApiRateLimiter | None = None,
+) -> dict[str, Any]:
+    if rate_limiter:
+        rate_limiter.wait()
     prompt = {
         "task": (
             "Classify whether this TikTok contains content signals related to "
@@ -930,7 +1012,11 @@ def empty_frame_info(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def enrich_one_video(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+def enrich_one_video(
+    row: dict[str, Any],
+    args: argparse.Namespace,
+    rate_limiter: ApiRateLimiter | None = None,
+) -> dict[str, Any]:
     video_id = str(row["video_id"])
     video_path = find_video_file(Path(args.video_dir), video_id)
     result = {
@@ -1001,10 +1087,10 @@ def enrich_one_video(row: dict[str, Any], args: argparse.Namespace) -> dict[str,
                     str(row.get("caption", "")),
                     args.vision_model,
                     args.max_vision_images,
+                    rate_limiter=rate_limiter,
                 )
                 summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
                 result["visual_summary"] = summary
-                time.sleep(args.api_sleep)
             except Exception as exc:
                 print(f"Vision summary failed for {video_id}: {exc}")
 
@@ -1018,10 +1104,11 @@ def run_enrichment_jobs(
 ) -> list[dict[str, Any]]:
     rows = [row.to_dict() for _, row in enriched.iterrows()]
     results = []
+    api_rate_limiter = ApiRateLimiter(args.api_sleep)
     tracker.start_stage("enrich", len(rows))
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_video_id = {
-            executor.submit(enrich_one_video, row, args): str(row["video_id"])
+            executor.submit(enrich_one_video, row, args, api_rate_limiter): str(row["video_id"])
             for row in rows
         }
         for future in as_completed(future_to_video_id):
@@ -1054,10 +1141,11 @@ def run_llm_predictions(
 ) -> list[str]:
     rows = [row for _, row in enriched.iterrows()]
     predictions = [""] * len(rows)
+    api_rate_limiter = ApiRateLimiter(args.api_sleep)
     tracker.start_stage("llm", len(rows))
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_index = {
-            executor.submit(llm_signal_prediction, row, args.llm_model): index
+            executor.submit(llm_signal_prediction, row, args.llm_model, api_rate_limiter): index
             for index, row in enumerate(rows)
         }
         for future in as_completed(future_to_index):
@@ -1068,7 +1156,6 @@ def run_llm_predictions(
                 predictions[index] = future.result()["llm_signal_prediction_json"]
                 print(f"Predicted labels for {video_id}")
                 tracker.increment("llm")
-                time.sleep(args.api_sleep)
             except Exception as exc:
                 print(f"LLM prediction failed for {video_id}: {exc}")
                 tracker.increment("llm", error=True)

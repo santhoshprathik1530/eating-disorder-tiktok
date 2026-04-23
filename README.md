@@ -191,7 +191,8 @@ python enrich_multimodal_features.py \
   --predict-with-llm \
   --cookie-file cookies.json \
   --workers 4 \
-  --max-vision-images 10
+  --max-vision-images 10 \
+  --api-sleep 3
 ```
 
 For TikTok posts that require login, put exported TikTok cookies in `cookies.json`. The script converts that file for `yt-dlp` automatically. If you exported a Netscape-format cookies file instead, pass it directly:
@@ -204,7 +205,8 @@ python enrich_multimodal_features.py \
   --predict-with-llm \
   --yt-dlp-cookies www.tiktok.com_cookies.txt \
   --workers 4 \
-  --max-vision-images 10
+  --max-vision-images 10 \
+  --api-sleep 3
 ```
 
 The enrichment script writes live progress files while it runs:
@@ -213,6 +215,8 @@ The enrichment script writes live progress files while it runs:
 pipeline_progress.json
 pipeline_dashboard.html
 ```
+
+If OpenRouter rate-limits the VM, increase `--api-sleep` to `3` or `5`. The script now spaces vision and LLM requests before each API call, so the sleep value acts as a true throttle across worker threads.
 
 To view the dashboard from the VM:
 
@@ -265,7 +269,8 @@ python enrich_multimodal_features.py \
   --summarize-frames \
   --predict-with-llm \
   --workers 4 \
-  --max-vision-images 10
+  --max-vision-images 10 \
+  --api-sleep 3
 ```
 
 ## Notes
