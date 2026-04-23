@@ -155,6 +155,46 @@ python3 enrich_multimodal_features.py \
 '
 ```
 
+## GCP VM Enrichment From Existing CSV
+
+Use this path when the TikTok data has already been extracted and you only need to build/enrich the 3-hashtag test set.
+
+```bash
+gcloud compute ssh VM_NAME --zone ZONE
+```
+
+Inside the VM:
+
+```bash
+# Safe cleanup: remove only the project folder, not the VM operating system.
+rm -rf ~/eating-disorder-tiktok
+
+git clone https://github.com/santhoshprathik1530/eating-disorder-tiktok.git ~/eating-disorder-tiktok
+cd ~/eating-disorder-tiktok
+
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt openai
+
+# Upload/copy the extracted CSV into this folder first:
+# tiktok_videos_2025_07_to_today.csv
+
+export OPENROUTER_API_KEY="your_openrouter_key"
+
+python build_testset_baseline.py
+
+python enrich_multimodal_features.py \
+  --download-videos \
+  --transcribe-audio \
+  --summarize-frames \
+  --predict-with-llm \
+  --workers 4 \
+  --max-vision-images 6
+```
+
+The baseline step filters to the 3 selected hashtags: `whatieatinaday`, `whatieatinday`, and `wieiad`. If the VM runs out of RAM during local Whisper transcription, rerun enrichment with `--workers 2`.
+
 ## Notes
 
 - Do not commit browser cookies, API keys, raw videos, transcripts, frame folders, CSV outputs, JSON outputs, or PDFs.

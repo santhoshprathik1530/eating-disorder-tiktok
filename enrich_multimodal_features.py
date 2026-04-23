@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -176,8 +177,7 @@ def aggregate_comments(comment_csv: Path, max_chars: int = 6000) -> pd.DataFrame
     return pd.DataFrame(grouped)
 
 
-def download_videos(videos: pd.DataFrame, video_dir: Path) -> None:
-    ensure_dir(video_dir)
+def download_video(row: dict[str, Any], video_dir: Path) -> None:
     yt_dlp_cmd = shutil.which("yt-dlp")
     if yt_dlp_cmd is None:
         try:
@@ -187,38 +187,46 @@ def download_videos(videos: pd.DataFrame, video_dir: Path) -> None:
         except Exception:
             print("yt-dlp is not installed; skipping video download.")
             return
-    for _, row in videos.iterrows():
-        video_id = str(row["video_id"])
-        output_template = str(video_dir / f"{video_id}.%(ext)s")
-        existing = list(video_dir.glob(f"{video_id}.*"))
-        if existing:
-            continue
-        if yt_dlp_cmd:
-            cmd = [
-                yt_dlp_cmd,
-                "--no-playlist",
-                "--quiet",
-                "--no-warnings",
-                "-o",
-                output_template,
-                str(row["video_url"]),
-            ]
-        else:
-            cmd = [
-                "python3",
-                "-m",
-                "yt_dlp",
-                "--no-playlist",
-                "--quiet",
-                "--no-warnings",
-                "-o",
-                output_template,
-                str(row["video_url"]),
-            ]
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as exc:
-            print(f"Download failed for {video_id}: {exc}")
+    video_id = str(row["video_id"])
+    output_template = str(video_dir / f"{video_id}.%(ext)s")
+    existing = list(video_dir.glob(f"{video_id}.*"))
+    if existing:
+        return
+    if yt_dlp_cmd:
+        cmd = [
+            yt_dlp_cmd,
+            "--no-playlist",
+            "--quiet",
+            "--no-warnings",
+            "-o",
+            output_template,
+            str(row["video_url"]),
+        ]
+    else:
+        cmd = [
+            "python3",
+            "-m",
+            "yt_dlp",
+            "--no-playlist",
+            "--quiet",
+            "--no-warnings",
+            "-o",
+            output_template,
+            str(row["video_url"]),
+        ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"Download failed for {video_id}: {exc}")
+
+
+def download_videos(videos: pd.DataFrame, video_dir: Path, workers: int) -> None:
+    ensure_dir(video_dir)
+    rows = [row.to_dict() for _, row in videos.iterrows()]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(download_video, row, video_dir) for row in rows]
+        for future in as_completed(futures):
+            future.result()
 
 
 def find_video_file(video_dir: Path, video_id: str) -> Path | None:
@@ -597,6 +605,151 @@ def add_parsed_llm_columns(enriched: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([enriched.reset_index(drop=True), parsed_df.reset_index(drop=True)], axis=1)
 
 
+def empty_media_info() -> dict[str, Any]:
+    return {
+        "video_duration_seconds": 0.0,
+        "video_fps": 0.0,
+        "video_frame_total": 0,
+        "has_audio": False,
+    }
+
+
+def empty_frame_info(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "frame_count": 0,
+        "sampled_frame_timestamps": "",
+        "frame_sampling_interval_seconds": args.frame_every_seconds,
+    }
+
+
+def enrich_one_video(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    video_id = str(row["video_id"])
+    video_path = find_video_file(Path(args.video_dir), video_id)
+    result = {
+        "video_id": video_id,
+        "audio_transcript": "",
+        "visual_summary": {"visual_frame_summary": "", "onscreen_text_ocr": ""},
+        "media_info": empty_media_info(),
+        "frame_info": empty_frame_info(args),
+    }
+    if not video_path:
+        return result
+
+    result["media_info"] = get_media_info(video_path)
+
+    if args.transcribe_audio:
+        transcript_path = Path(args.audio_dir) / f"{video_id}.transcript.txt"
+        cached_transcript = (
+            transcript_path.read_text(encoding="utf-8").strip()
+            if transcript_path.exists()
+            else ""
+        )
+        if cached_transcript:
+            result["audio_transcript"] = cached_transcript
+        else:
+            try:
+                if args.transcription_backend == "faster-whisper":
+                    transcript = transcribe_with_local_fallback(
+                        video_path,
+                        Path(args.audio_dir),
+                        args.faster_whisper_model,
+                        args.faster_whisper_device,
+                    )
+                else:
+                    audio_path = extract_audio(video_path, Path(args.audio_dir))
+                    transcript = (
+                        transcribe_audio_openai(audio_path, args.whisper_model)
+                        if audio_path
+                        else ""
+                    )
+                transcript_path.write_text(transcript, encoding="utf-8")
+                result["audio_transcript"] = transcript
+            except Exception as exc:
+                print(f"Transcription failed for {video_id}: {exc}")
+
+    if args.summarize_frames:
+        video_frame_dir = Path(args.frame_dir) / video_id
+        sampled_frames = sample_frames(
+            video_path, video_frame_dir, args.frame_every_seconds, args.max_frames
+        )
+        frames = [frame["path"] for frame in sampled_frames]
+        timestamps = [str(frame["timestamp_seconds"]) for frame in sampled_frames]
+        result["frame_info"] = {
+            "frame_count": len(sampled_frames),
+            "sampled_frame_timestamps": ";".join(timestamps),
+            "frame_sampling_interval_seconds": args.frame_every_seconds,
+        }
+        interval_label = str(args.frame_every_seconds).replace(".", "p")
+        image_cap_label = "all" if args.max_vision_images <= 0 else str(args.max_vision_images)
+        summary_path = video_frame_dir / (
+            f"vision_summary_every_{interval_label}s_images_{image_cap_label}.json"
+        )
+        if summary_path.exists():
+            result["visual_summary"] = json.loads(summary_path.read_text(encoding="utf-8"))
+        else:
+            try:
+                summary = summarize_frames_openrouter(
+                    frames,
+                    str(row.get("caption", "")),
+                    args.vision_model,
+                    args.max_vision_images,
+                )
+                summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+                result["visual_summary"] = summary
+                time.sleep(args.api_sleep)
+            except Exception as exc:
+                print(f"Vision summary failed for {video_id}: {exc}")
+
+    return result
+
+
+def run_enrichment_jobs(enriched: pd.DataFrame, args: argparse.Namespace) -> list[dict[str, Any]]:
+    rows = [row.to_dict() for _, row in enriched.iterrows()]
+    results = []
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_to_video_id = {
+            executor.submit(enrich_one_video, row, args): str(row["video_id"])
+            for row in rows
+        }
+        for future in as_completed(future_to_video_id):
+            video_id = future_to_video_id[future]
+            try:
+                results.append(future.result())
+                print(f"Enriched {video_id}")
+            except Exception as exc:
+                print(f"Enrichment failed for {video_id}: {exc}")
+                results.append(
+                    {
+                        "video_id": video_id,
+                        "audio_transcript": "",
+                        "visual_summary": {"visual_frame_summary": "", "onscreen_text_ocr": ""},
+                        "media_info": empty_media_info(),
+                        "frame_info": empty_frame_info(args),
+                    }
+                )
+    return results
+
+
+def run_llm_predictions(enriched: pd.DataFrame, args: argparse.Namespace) -> list[str]:
+    rows = [row for _, row in enriched.iterrows()]
+    predictions = [""] * len(rows)
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_to_index = {
+            executor.submit(llm_signal_prediction, row, args.llm_model): index
+            for index, row in enumerate(rows)
+        }
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            video_id = rows[index].get("video_id", "")
+            try:
+                predictions[index] = future.result()["llm_signal_prediction_json"]
+                print(f"Predicted labels for {video_id}")
+                time.sleep(args.api_sleep)
+            except Exception as exc:
+                print(f"LLM prediction failed for {video_id}: {exc}")
+    return predictions
+
+
 def enrich_rows(args: argparse.Namespace) -> pd.DataFrame:
     baseline = pd.read_csv(args.input_features, dtype={"video_id": str}).fillna("")
     comments = aggregate_comments(Path(args.comments_csv))
@@ -614,94 +767,14 @@ def enrich_rows(args: argparse.Namespace) -> pd.DataFrame:
     frame_infos: dict[str, dict[str, Any]] = {}
 
     if args.download_videos:
-        download_videos(enriched, Path(args.video_dir))
+        download_videos(enriched, Path(args.video_dir), args.workers)
 
-    for _, row in enriched.iterrows():
-        video_id = str(row["video_id"])
-        video_path = find_video_file(Path(args.video_dir), video_id)
-        if not video_path:
-            audio_transcripts[video_id] = ""
-            visual_summaries[video_id] = {"visual_frame_summary": "", "onscreen_text_ocr": ""}
-            media_infos[video_id] = {
-                "video_duration_seconds": 0.0,
-                "video_fps": 0.0,
-                "video_frame_total": 0,
-                "has_audio": False,
-            }
-            frame_infos[video_id] = {
-                "frame_count": 0,
-                "sampled_frame_timestamps": "",
-                "frame_sampling_interval_seconds": args.frame_every_seconds,
-            }
-            continue
-
-        media_infos[video_id] = get_media_info(video_path)
-
-        if args.transcribe_audio:
-            transcript_path = Path(args.audio_dir) / f"{video_id}.transcript.txt"
-            if transcript_path.exists() and transcript_path.read_text(encoding="utf-8").strip():
-                audio_transcripts[video_id] = transcript_path.read_text(encoding="utf-8")
-            else:
-                try:
-                    if args.transcription_backend == "faster-whisper":
-                        transcript = transcribe_with_local_fallback(
-                            video_path,
-                            Path(args.audio_dir),
-                            args.faster_whisper_model,
-                            args.faster_whisper_device,
-                        )
-                    else:
-                        audio_path = extract_audio(video_path, Path(args.audio_dir))
-                        transcript = (
-                            transcribe_audio_openai(audio_path, args.whisper_model)
-                            if audio_path
-                            else ""
-                        )
-                    transcript_path.write_text(transcript, encoding="utf-8")
-                    audio_transcripts[video_id] = transcript
-                except Exception as exc:
-                    print(f"Transcription failed for {video_id}: {exc}")
-                    audio_transcripts[video_id] = ""
-
-        if args.summarize_frames:
-            video_frame_dir = Path(args.frame_dir) / video_id
-            sampled_frames = sample_frames(
-                video_path, video_frame_dir, args.frame_every_seconds, args.max_frames
-            )
-            frames = [frame["path"] for frame in sampled_frames]
-            timestamps = [str(frame["timestamp_seconds"]) for frame in sampled_frames]
-            frame_infos[video_id] = {
-                "frame_count": len(sampled_frames),
-                "sampled_frame_timestamps": ";".join(timestamps),
-                "frame_sampling_interval_seconds": args.frame_every_seconds,
-            }
-            interval_label = str(args.frame_every_seconds).replace(".", "p")
-            image_cap_label = "all" if args.max_vision_images <= 0 else str(args.max_vision_images)
-            summary_path = video_frame_dir / (
-                f"vision_summary_every_{interval_label}s_images_{image_cap_label}.json"
-            )
-            if summary_path.exists():
-                visual_summaries[video_id] = json.loads(summary_path.read_text(encoding="utf-8"))
-            else:
-                try:
-                    summary = summarize_frames_openrouter(
-                        frames,
-                        str(row.get("caption", "")),
-                        args.vision_model,
-                        args.max_vision_images,
-                    )
-                    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-                    visual_summaries[video_id] = summary
-                    time.sleep(args.api_sleep)
-                except Exception as exc:
-                    print(f"Vision summary failed for {video_id}: {exc}")
-                    visual_summaries[video_id] = {"visual_frame_summary": "", "onscreen_text_ocr": ""}
-        else:
-            frame_infos[video_id] = {
-                "frame_count": 0,
-                "sampled_frame_timestamps": "",
-                "frame_sampling_interval_seconds": args.frame_every_seconds,
-            }
+    for result in run_enrichment_jobs(enriched, args):
+        video_id = result["video_id"]
+        audio_transcripts[video_id] = result["audio_transcript"]
+        visual_summaries[video_id] = result["visual_summary"]
+        media_infos[video_id] = result["media_info"]
+        frame_infos[video_id] = result["frame_info"]
 
     enriched["audio_transcript"] = enriched["video_id"].map(audio_transcripts).fillna("")
     enriched["video_duration_seconds"] = enriched["video_id"].map(
@@ -744,17 +817,7 @@ def enrich_rows(args: argparse.Namespace) -> pd.DataFrame:
     enriched = pd.concat([enriched.reset_index(drop=True), visual_flags_df.reset_index(drop=True)], axis=1)
 
     if args.predict_with_llm:
-        predictions = []
-        for _, row in enriched.iterrows():
-            try:
-                predictions.append(llm_signal_prediction(row, args.llm_model))
-                time.sleep(args.api_sleep)
-            except Exception as exc:
-                print(f"LLM prediction failed for {row['video_id']}: {exc}")
-                predictions.append({"llm_signal_prediction_json": ""})
-        enriched["llm_signal_prediction_json"] = [
-            prediction["llm_signal_prediction_json"] for prediction in predictions
-        ]
+        enriched["llm_signal_prediction_json"] = run_llm_predictions(enriched, args)
     else:
         enriched["llm_signal_prediction_json"] = ""
 
@@ -772,6 +835,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", default="testset_enriched_features.json")
     parser.add_argument("--comments-csv", default="testset_comments.csv")
     parser.add_argument("--cookie-file", default="cookies.json")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Parallel workers for downloads, transcription, frame summaries, and LLM calls.",
+    )
     parser.add_argument("--comments-per-video", type=int, default=30)
     parser.add_argument("--collect-comments", action="store_true")
     parser.add_argument("--browser", default="chromium", choices=["chromium", "webkit", "firefox"])
@@ -814,6 +883,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.workers < 1:
+        raise ValueError("--workers must be >= 1")
     baseline = pd.read_csv(args.input_features, dtype={"video_id": str}).fillna("")
 
     if args.collect_comments:
