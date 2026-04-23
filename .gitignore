@@ -9,6 +9,7 @@ www.tiktok.com_cookies.txt
 
 # Local outputs
 *.csv
+!tiktok_videos_2025_07_to_today.csv
 *.json
 *.log
 top20_audio/
