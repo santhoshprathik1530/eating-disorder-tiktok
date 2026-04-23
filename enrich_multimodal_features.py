@@ -387,7 +387,44 @@ def aggregate_comments(comment_csv: Path, max_chars: int = 6000) -> pd.DataFrame
     return pd.DataFrame(grouped)
 
 
-def download_video(row: dict[str, Any], video_dir: Path) -> None:
+def write_yt_dlp_cookies(cookie_file: Path, output_file: Path) -> Path | None:
+    if not cookie_file.exists():
+        return None
+    raw = json.loads(cookie_file.read_text(encoding="utf-8"))
+    cookies = raw if isinstance(raw, list) else raw.get("cookies", [])
+    lines = ["# Netscape HTTP Cookie File"]
+    for cookie in cookies:
+        domain = str(cookie.get("domain", ""))
+        if "tiktok.com" not in domain:
+            continue
+        include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+        path = str(cookie.get("path") or "/")
+        secure = "TRUE" if cookie.get("secure") else "FALSE"
+        expires = str(int(cookie.get("expirationDate") or cookie.get("expires") or 0))
+        name = str(cookie.get("name", ""))
+        value = str(cookie.get("value", ""))
+        if name:
+            lines.append(
+                "\t".join([domain, include_subdomains, path, secure, expires, name, value])
+            )
+    if len(lines) == 1:
+        return None
+    output_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_file
+
+
+def resolve_yt_dlp_cookie_file(args: argparse.Namespace) -> Path | None:
+    if args.yt_dlp_cookies:
+        cookie_path = Path(args.yt_dlp_cookies)
+        return cookie_path if cookie_path.exists() else None
+    return write_yt_dlp_cookies(Path(args.cookie_file), Path(args.yt_dlp_cookie_output))
+
+
+def download_video(
+    row: dict[str, Any],
+    video_dir: Path,
+    yt_dlp_cookie_file: Path | None,
+) -> None:
     yt_dlp_cmd = shutil.which("yt-dlp")
     if yt_dlp_cmd is None:
         try:
@@ -424,6 +461,9 @@ def download_video(row: dict[str, Any], video_dir: Path) -> None:
             output_template,
             str(row["video_url"]),
         ]
+    if yt_dlp_cookie_file:
+        insert_at = 1 if yt_dlp_cmd else 3
+        cmd[insert_at:insert_at] = ["--cookies", str(yt_dlp_cookie_file)]
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as exc:
@@ -434,6 +474,7 @@ def download_videos(
     videos: pd.DataFrame,
     video_dir: Path,
     workers: int,
+    yt_dlp_cookie_file: Path | None,
     tracker: ProgressTracker,
 ) -> None:
     ensure_dir(video_dir)
@@ -441,7 +482,7 @@ def download_videos(
     tracker.start_stage("download", len(rows))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_video_id = {
-            executor.submit(download_video, row, video_dir): str(row["video_id"])
+            executor.submit(download_video, row, video_dir, yt_dlp_cookie_file): str(row["video_id"])
             for row in rows
         }
         for future in as_completed(future_to_video_id):
@@ -1012,7 +1053,18 @@ def enrich_rows(args: argparse.Namespace, tracker: ProgressTracker) -> pd.DataFr
     frame_infos: dict[str, dict[str, Any]] = {}
 
     if args.download_videos:
-        download_videos(enriched, Path(args.video_dir), args.workers, tracker)
+        yt_dlp_cookie_file = resolve_yt_dlp_cookie_file(args)
+        if yt_dlp_cookie_file:
+            print(f"Using yt-dlp cookies from {yt_dlp_cookie_file}")
+        else:
+            print("No yt-dlp cookies found; restricted TikTok downloads may fail.")
+        download_videos(
+            enriched,
+            Path(args.video_dir),
+            args.workers,
+            yt_dlp_cookie_file,
+            tracker,
+        )
     else:
         tracker.skip_stage("download")
 
@@ -1085,6 +1137,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dashboard-html", default="pipeline_dashboard.html")
     parser.add_argument("--comments-csv", default="testset_comments.csv")
     parser.add_argument("--cookie-file", default="cookies.json")
+    parser.add_argument(
+        "--yt-dlp-cookies",
+        default="",
+        help="Optional Netscape-format cookies.txt for yt-dlp downloads.",
+    )
+    parser.add_argument(
+        "--yt-dlp-cookie-output",
+        default="yt_dlp_cookies.txt",
+        help="Temporary Netscape cookies file generated from --cookie-file.",
+    )
     parser.add_argument(
         "--workers",
         type=int,

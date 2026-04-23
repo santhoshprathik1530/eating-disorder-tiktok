@@ -189,6 +189,20 @@ python enrich_multimodal_features.py \
   --transcribe-audio \
   --summarize-frames \
   --predict-with-llm \
+  --cookie-file cookies.json \
+  --workers 4 \
+  --max-vision-images 10
+```
+
+For TikTok posts that require login, put exported TikTok cookies in `cookies.json`. The script converts that file for `yt-dlp` automatically. If you exported a Netscape-format cookies file instead, pass it directly:
+
+```bash
+python enrich_multimodal_features.py \
+  --download-videos \
+  --transcribe-audio \
+  --summarize-frames \
+  --predict-with-llm \
+  --yt-dlp-cookies www.tiktok.com_cookies.txt \
   --workers 4 \
   --max-vision-images 10
 ```
