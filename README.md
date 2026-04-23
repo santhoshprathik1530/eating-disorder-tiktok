@@ -190,7 +190,26 @@ python enrich_multimodal_features.py \
   --summarize-frames \
   --predict-with-llm \
   --workers 4 \
-  --max-vision-images 6
+  --max-vision-images 10
+```
+
+The enrichment script writes live progress files while it runs:
+
+```text
+pipeline_progress.json
+pipeline_dashboard.html
+```
+
+To view the dashboard from the VM:
+
+```bash
+python serve_pipeline_dashboard.py --port 8000
+```
+
+Then open:
+
+```text
+http://VM_EXTERNAL_IP:8000/pipeline_dashboard.html
 ```
 
 The baseline step filters to the 3 selected hashtags: `whatieatinaday`, `whatieatinday`, and `wieiad`. If the VM runs out of RAM during local Whisper transcription, rerun enrichment with `--workers 2`.

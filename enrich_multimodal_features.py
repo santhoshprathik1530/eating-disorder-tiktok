@@ -23,8 +23,10 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,10 @@ HUMAN_LABEL_COLUMNS = [
 ]
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def normalize_text(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
@@ -77,6 +83,202 @@ def append_rows(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -
         if not exists:
             writer.writeheader()
         writer.writerows(rows)
+
+
+def percent(done: int, total: int) -> float:
+    return round((done / total) * 100, 1) if total else 0.0
+
+
+def build_dashboard_html(progress: dict[str, Any]) -> str:
+    stages = progress.get("stages", {})
+    rows = []
+    for name, stage in stages.items():
+        total = int(stage.get("total", 0))
+        completed = int(stage.get("completed", 0))
+        pct = percent(completed, total)
+        rows.append(
+            f"""
+            <tr>
+              <td>{name}</td>
+              <td>{stage.get("status", "pending")}</td>
+              <td>{completed}/{total}</td>
+              <td><div class="bar"><span style="width:{pct}%"></span></div></td>
+              <td>{pct}%</td>
+              <td>{stage.get("errors", 0)}</td>
+            </tr>
+            """
+        )
+    active_items = progress.get("active_items", {})
+    active_html = "".join(
+        f"<tr><td>{stage}</td><td><code>{video_id}</code></td></tr>"
+        for stage, video_id in sorted(active_items.items())
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="10">
+  <title>Enrichment Pipeline Dashboard</title>
+  <style>
+    :root {{
+      --bg: #08111f;
+      --panel: #101827;
+      --text: #eef4ff;
+      --muted: #93a4bb;
+      --line: #253247;
+      --good: #4ade80;
+      --warn: #fbbf24;
+      --accent: #67e8f9;
+    }}
+    body {{
+      margin: 0;
+      padding: 28px;
+      background:
+        radial-gradient(circle at top left, rgba(103,232,249,.18), transparent 35%),
+        linear-gradient(135deg, #08111f, #111827 55%, #0f172a);
+      color: var(--text);
+      font-family: Avenir Next, Trebuchet MS, Verdana, sans-serif;
+    }}
+    h1 {{ margin: 0 0 6px; font-size: 32px; }}
+    h2 {{ margin: 0 0 12px; }}
+    .muted {{ color: var(--muted); }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 16px;
+      margin: 22px 0;
+    }}
+    .card {{
+      background: rgba(16,24,39,.9);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 18px 40px rgba(0,0,0,.24);
+    }}
+    .metric {{ font-size: 34px; font-weight: 800; color: var(--good); }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; }}
+    th {{ color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
+    code {{ background: rgba(255,255,255,.08); padding: 3px 7px; border-radius: 7px; }}
+    .bar {{ height: 10px; min-width: 150px; background: #1e293b; border-radius: 999px; overflow: hidden; }}
+    .bar span {{ display: block; height: 100%; background: linear-gradient(90deg, var(--good), var(--accent)); }}
+    .two {{ display: grid; grid-template-columns: 1.4fr .8fr; gap: 16px; }}
+    @media (max-width: 900px) {{ .two {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <h1>Enrichment Pipeline Dashboard</h1>
+  <div class="muted">Auto-refreshes every 10 seconds. Last updated: <code>{progress.get("last_updated_at", "")}</code></div>
+
+  <div class="grid">
+    <div class="card"><div class="muted">Rows</div><div class="metric">{progress.get("total_rows", 0)}</div></div>
+    <div class="card"><div class="muted">Current Stage</div><div class="metric">{progress.get("current_stage", "starting")}</div></div>
+    <div class="card"><div class="muted">Workers</div><div class="metric">{progress.get("workers", 0)}</div></div>
+    <div class="card"><div class="muted">Status</div><div class="metric">{progress.get("status", "running")}</div></div>
+  </div>
+
+  <div class="two">
+    <div class="card">
+      <h2>Stages</h2>
+      <table>
+        <thead><tr><th>Stage</th><th>Status</th><th>Done</th><th>Progress</th><th>%</th><th>Errors</th></tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Active Items</h2>
+      <table>
+        <thead><tr><th>Stage</th><th>Video ID</th></tr></thead>
+        <tbody>{active_html or "<tr><td colspan='2'>No active items.</td></tr>"}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h2>Output</h2>
+    <div class="muted">CSV: <code>{progress.get("output_csv", "")}</code></div>
+    <div class="muted">JSON: <code>{progress.get("output_json", "")}</code></div>
+  </div>
+</body>
+</html>"""
+
+
+class ProgressTracker:
+    def __init__(self, args: argparse.Namespace, total_rows: int) -> None:
+        self.path = Path(args.progress_json)
+        self.dashboard_path = Path(args.dashboard_html)
+        self.lock = threading.Lock()
+        self.progress: dict[str, Any] = {
+            "started_at": utc_now_iso(),
+            "last_updated_at": utc_now_iso(),
+            "status": "running",
+            "current_stage": "starting",
+            "total_rows": total_rows,
+            "workers": args.workers,
+            "input_features": args.input_features,
+            "output_csv": args.output_csv,
+            "output_json": args.output_json,
+            "active_items": {},
+            "stages": {
+                "comments": {"status": "skipped", "total": 0, "completed": 0, "errors": 0},
+                "download": {"status": "pending", "total": 0, "completed": 0, "errors": 0},
+                "enrich": {"status": "pending", "total": total_rows, "completed": 0, "errors": 0},
+                "llm": {"status": "pending", "total": 0, "completed": 0, "errors": 0},
+                "write_outputs": {"status": "pending", "total": 2, "completed": 0, "errors": 0},
+            },
+        }
+        self.write()
+
+    def write(self) -> None:
+        self.progress["last_updated_at"] = utc_now_iso()
+        self.path.write_text(json.dumps(self.progress, indent=2), encoding="utf-8")
+        self.dashboard_path.write_text(build_dashboard_html(self.progress), encoding="utf-8")
+
+    def start_stage(self, stage: str, total: int | None = None) -> None:
+        with self.lock:
+            self.progress["current_stage"] = stage
+            item = self.progress["stages"][stage]
+            item["status"] = "running"
+            if total is not None:
+                item["total"] = total
+            self.write()
+
+    def finish_stage(self, stage: str) -> None:
+        with self.lock:
+            self.progress["stages"][stage]["status"] = "done"
+            self.progress["active_items"].pop(stage, None)
+            self.write()
+
+    def skip_stage(self, stage: str) -> None:
+        with self.lock:
+            self.progress["stages"][stage]["status"] = "skipped"
+            self.progress["active_items"].pop(stage, None)
+            self.write()
+
+    def increment(self, stage: str, amount: int = 1, error: bool = False) -> None:
+        with self.lock:
+            item = self.progress["stages"][stage]
+            item["completed"] += amount
+            if error:
+                item["errors"] += 1
+            self.write()
+
+    def active(self, stage: str, video_id: str | None) -> None:
+        with self.lock:
+            if video_id:
+                self.progress["active_items"][stage] = video_id
+            else:
+                self.progress["active_items"].pop(stage, None)
+            self.write()
+
+    def done(self) -> None:
+        with self.lock:
+            self.progress["status"] = "done"
+            self.progress["current_stage"] = "complete"
+            self.progress["finished_at"] = utc_now_iso()
+            self.progress["active_items"] = {}
+            self.write()
 
 
 def load_cookie_map(cookie_file: Path) -> dict[str, str]:
@@ -102,6 +304,7 @@ async def collect_comments_for_videos(
     headless: bool,
     min_sleep: float,
     max_sleep: float,
+    tracker: ProgressTracker,
 ) -> None:
     from TikTokApi import TikTokApi
     from TikTokApi.exceptions import InvalidResponseException
@@ -112,6 +315,7 @@ async def collect_comments_for_videos(
         previous = pd.read_csv(output_csv, dtype={"video_id": str})
         rows_to_skip = set(previous["video_id"].dropna().astype(str))
 
+    tracker.start_stage("comments", len(videos))
     async with TikTokApi() as api:
         await api.create_sessions(
             cookies=[cookie_map],
@@ -123,8 +327,11 @@ async def collect_comments_for_videos(
         for _, row in videos.iterrows():
             video_id = str(row["video_id"])
             if video_id in rows_to_skip:
+                tracker.increment("comments")
                 continue
+            tracker.active("comments", video_id)
             pending = []
+            failed = False
             try:
                 async for comment in api.video(id=video_id).comments(count=comments_per_video):
                     data = getattr(comment, "as_dict", {}) or {}
@@ -142,11 +349,14 @@ async def collect_comments_for_videos(
                     )
                     await asyncio.sleep(min_sleep)
             except InvalidResponseException:
-                pass
+                failed = True
             except Exception as exc:
                 print(f"Comment collection failed for {video_id}: {exc}")
+                failed = True
             append_rows(output_csv, COMMENT_FIELDS, pending)
+            tracker.increment("comments", error=failed)
             await asyncio.sleep(max_sleep)
+    tracker.finish_stage("comments")
 
 
 def aggregate_comments(comment_csv: Path, max_chars: int = 6000) -> pd.DataFrame:
@@ -220,13 +430,30 @@ def download_video(row: dict[str, Any], video_dir: Path) -> None:
         print(f"Download failed for {video_id}: {exc}")
 
 
-def download_videos(videos: pd.DataFrame, video_dir: Path, workers: int) -> None:
+def download_videos(
+    videos: pd.DataFrame,
+    video_dir: Path,
+    workers: int,
+    tracker: ProgressTracker,
+) -> None:
     ensure_dir(video_dir)
     rows = [row.to_dict() for _, row in videos.iterrows()]
+    tracker.start_stage("download", len(rows))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(download_video, row, video_dir) for row in rows]
-        for future in as_completed(futures):
-            future.result()
+        future_to_video_id = {
+            executor.submit(download_video, row, video_dir): str(row["video_id"])
+            for row in rows
+        }
+        for future in as_completed(future_to_video_id):
+            video_id = future_to_video_id[future]
+            tracker.active("download", video_id)
+            try:
+                future.result()
+                tracker.increment("download")
+            except Exception as exc:
+                print(f"Download failed for {video_id}: {exc}")
+                tracker.increment("download", error=True)
+    tracker.finish_stage("download")
 
 
 def find_video_file(video_dir: Path, video_id: str) -> Path | None:
@@ -703,9 +930,14 @@ def enrich_one_video(row: dict[str, Any], args: argparse.Namespace) -> dict[str,
     return result
 
 
-def run_enrichment_jobs(enriched: pd.DataFrame, args: argparse.Namespace) -> list[dict[str, Any]]:
+def run_enrichment_jobs(
+    enriched: pd.DataFrame,
+    args: argparse.Namespace,
+    tracker: ProgressTracker,
+) -> list[dict[str, Any]]:
     rows = [row.to_dict() for _, row in enriched.iterrows()]
     results = []
+    tracker.start_stage("enrich", len(rows))
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_video_id = {
             executor.submit(enrich_one_video, row, args): str(row["video_id"])
@@ -713,9 +945,11 @@ def run_enrichment_jobs(enriched: pd.DataFrame, args: argparse.Namespace) -> lis
         }
         for future in as_completed(future_to_video_id):
             video_id = future_to_video_id[future]
+            tracker.active("enrich", video_id)
             try:
                 results.append(future.result())
                 print(f"Enriched {video_id}")
+                tracker.increment("enrich")
             except Exception as exc:
                 print(f"Enrichment failed for {video_id}: {exc}")
                 results.append(
@@ -727,12 +961,19 @@ def run_enrichment_jobs(enriched: pd.DataFrame, args: argparse.Namespace) -> lis
                         "frame_info": empty_frame_info(args),
                     }
                 )
+                tracker.increment("enrich", error=True)
+    tracker.finish_stage("enrich")
     return results
 
 
-def run_llm_predictions(enriched: pd.DataFrame, args: argparse.Namespace) -> list[str]:
+def run_llm_predictions(
+    enriched: pd.DataFrame,
+    args: argparse.Namespace,
+    tracker: ProgressTracker,
+) -> list[str]:
     rows = [row for _, row in enriched.iterrows()]
     predictions = [""] * len(rows)
+    tracker.start_stage("llm", len(rows))
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_index = {
             executor.submit(llm_signal_prediction, row, args.llm_model): index
@@ -741,16 +982,20 @@ def run_llm_predictions(enriched: pd.DataFrame, args: argparse.Namespace) -> lis
         for future in as_completed(future_to_index):
             index = future_to_index[future]
             video_id = rows[index].get("video_id", "")
+            tracker.active("llm", str(video_id))
             try:
                 predictions[index] = future.result()["llm_signal_prediction_json"]
                 print(f"Predicted labels for {video_id}")
+                tracker.increment("llm")
                 time.sleep(args.api_sleep)
             except Exception as exc:
                 print(f"LLM prediction failed for {video_id}: {exc}")
+                tracker.increment("llm", error=True)
+    tracker.finish_stage("llm")
     return predictions
 
 
-def enrich_rows(args: argparse.Namespace) -> pd.DataFrame:
+def enrich_rows(args: argparse.Namespace, tracker: ProgressTracker) -> pd.DataFrame:
     baseline = pd.read_csv(args.input_features, dtype={"video_id": str}).fillna("")
     comments = aggregate_comments(Path(args.comments_csv))
     enriched = baseline.merge(comments, on="video_id", how="left").fillna("")
@@ -767,9 +1012,11 @@ def enrich_rows(args: argparse.Namespace) -> pd.DataFrame:
     frame_infos: dict[str, dict[str, Any]] = {}
 
     if args.download_videos:
-        download_videos(enriched, Path(args.video_dir), args.workers)
+        download_videos(enriched, Path(args.video_dir), args.workers, tracker)
+    else:
+        tracker.skip_stage("download")
 
-    for result in run_enrichment_jobs(enriched, args):
+    for result in run_enrichment_jobs(enriched, args, tracker):
         video_id = result["video_id"]
         audio_transcripts[video_id] = result["audio_transcript"]
         visual_summaries[video_id] = result["visual_summary"]
@@ -817,8 +1064,9 @@ def enrich_rows(args: argparse.Namespace) -> pd.DataFrame:
     enriched = pd.concat([enriched.reset_index(drop=True), visual_flags_df.reset_index(drop=True)], axis=1)
 
     if args.predict_with_llm:
-        enriched["llm_signal_prediction_json"] = run_llm_predictions(enriched, args)
+        enriched["llm_signal_prediction_json"] = run_llm_predictions(enriched, args, tracker)
     else:
+        tracker.skip_stage("llm")
         enriched["llm_signal_prediction_json"] = ""
 
     enriched = add_parsed_llm_columns(enriched)
@@ -833,6 +1081,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-features", default="testset_baseline_features.csv")
     parser.add_argument("--output-csv", default="testset_enriched_features.csv")
     parser.add_argument("--output-json", default="testset_enriched_features.json")
+    parser.add_argument("--progress-json", default="pipeline_progress.json")
+    parser.add_argument("--dashboard-html", default="pipeline_dashboard.html")
     parser.add_argument("--comments-csv", default="testset_comments.csv")
     parser.add_argument("--cookie-file", default="cookies.json")
     parser.add_argument(
@@ -886,6 +1136,7 @@ def main() -> None:
     if args.workers < 1:
         raise ValueError("--workers must be >= 1")
     baseline = pd.read_csv(args.input_features, dtype={"video_id": str}).fillna("")
+    tracker = ProgressTracker(args, len(baseline))
 
     if args.collect_comments:
         asyncio.run(
@@ -898,17 +1149,27 @@ def main() -> None:
                 args.headless,
                 args.min_sleep,
                 args.max_sleep,
+                tracker,
             )
         )
+    else:
+        tracker.skip_stage("comments")
 
-    enriched = enrich_rows(args)
+    enriched = enrich_rows(args, tracker)
+    tracker.start_stage("write_outputs", 2)
     enriched.to_csv(args.output_csv, index=False)
+    tracker.increment("write_outputs")
     Path(args.output_json).write_text(
         json.dumps(enriched.to_dict(orient="records"), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    tracker.increment("write_outputs")
+    tracker.finish_stage("write_outputs")
+    tracker.done()
     print(f"Wrote {len(enriched)} rows to {args.output_csv}")
     print(f"Wrote JSON to {args.output_json}")
+    print(f"Wrote progress JSON to {args.progress_json}")
+    print(f"Wrote dashboard to {args.dashboard_html}")
 
 
 if __name__ == "__main__":
