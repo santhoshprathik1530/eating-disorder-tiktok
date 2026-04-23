@@ -218,6 +218,20 @@ pipeline_dashboard.html
 
 If OpenRouter rate-limits the VM, increase `--api-sleep` to `3` or `5`. The script now spaces vision and LLM requests before each API call, so the sleep value acts as a true throttle across worker threads.
 
+The script also accepts comma-separated fallback model lists. If one OpenRouter model is rate-limited or unavailable, it automatically tries the next one.
+
+Example:
+
+```bash
+python enrich_multimodal_features.py \
+  --summarize-frames \
+  --predict-with-llm \
+  --workers 1 \
+  --api-sleep 5 \
+  --vision-model "nvidia/nemotron-nano-12b-v2-vl:free,qwen/qwen2.5-vl-72b-instruct:free,meta-llama/llama-3.2-11b-vision-instruct:free" \
+  --llm-model "openai/gpt-oss-20b:free,meta-llama/llama-3.3-70b-instruct:free,mistralai/mistral-small-3.2-24b-instruct:free"
+```
+
 To view the dashboard from the VM:
 
 ```bash

@@ -61,6 +61,18 @@ HUMAN_LABEL_COLUMNS = [
     "human_notes",
 ]
 
+DEFAULT_VISION_MODELS = [
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "qwen/qwen2.5-vl-72b-instruct:free",
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+]
+
+DEFAULT_LLM_MODELS = [
+    "openai/gpt-oss-20b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "mistralai/mistral-small-3.2-24b-instruct:free",
+]
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -68,6 +80,11 @@ def utc_now_iso() -> str:
 
 def normalize_text(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def parse_model_list(value: str, defaults: list[str]) -> list[str]:
+    models = [item.strip() for item in str(value or "").split(",") if item.strip()]
+    return models or list(defaults)
 
 
 def ensure_dir(path: Path) -> None:
@@ -783,10 +800,39 @@ def call_openrouter(messages: list[dict[str, Any]], model: str, temperature: flo
     return data["choices"][0]["message"]["content"]
 
 
+def call_openrouter_with_fallback(
+    messages: list[dict[str, Any]],
+    models: list[str],
+    temperature: float = 0.0,
+) -> tuple[str, str]:
+    last_error: Exception | None = None
+    for model in models:
+        try:
+            return call_openrouter(messages, model=model, temperature=temperature), model
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            body = exc.response.text[:500] if exc.response is not None else str(exc)
+            if status_code in {429, 502, 503, 504}:
+                print(f"OpenRouter model {model} failed with HTTP {status_code}; trying fallback.")
+                last_error = exc
+                continue
+            if any(token in body.lower() for token in ["no endpoints found", "not a valid model", "model not found"]):
+                print(f"OpenRouter model {model} unavailable; trying fallback.")
+                last_error = exc
+                continue
+            raise
+        except Exception as exc:
+            last_error = exc
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError("No OpenRouter models configured.")
+
+
 def summarize_frames_openrouter(
     frame_paths: list[Path],
     caption: str,
-    model: str,
+    models: list[str],
     max_images: int,
     rate_limiter: ApiRateLimiter | None = None,
 ) -> dict[str, str]:
@@ -812,15 +858,23 @@ def summarize_frames_openrouter(
     ]
     for path in selected:
         content.append({"type": "image_url", "image_url": {"url": image_to_data_url(path)}})
-    raw = call_openrouter([{"role": "user", "content": content}], model=model)
+    raw, used_model = call_openrouter_with_fallback(
+        [{"role": "user", "content": content}],
+        models=models,
+    )
     try:
         parsed = json.loads(extract_json(raw))
         return {
             "visual_frame_summary": normalize_text(parsed.get("visual_frame_summary")),
             "onscreen_text_ocr": normalize_text(parsed.get("onscreen_text_ocr")),
+            "vision_model_used": used_model,
         }
     except Exception:
-        return {"visual_frame_summary": normalize_text(raw), "onscreen_text_ocr": ""}
+        return {
+            "visual_frame_summary": normalize_text(raw),
+            "onscreen_text_ocr": "",
+            "vision_model_used": used_model,
+        }
 
 
 def extract_json(text: str) -> str:
@@ -837,7 +891,7 @@ def extract_json(text: str) -> str:
 
 def llm_signal_prediction(
     row: pd.Series,
-    model: str,
+    models: list[str],
     rate_limiter: ApiRateLimiter | None = None,
 ) -> dict[str, Any]:
     if rate_limiter:
@@ -876,7 +930,7 @@ def llm_signal_prediction(
             "visual_frame_summary": row.get("visual_frame_summary", ""),
         },
     }
-    raw = call_openrouter(
+    raw, used_model = call_openrouter_with_fallback(
         [
             {
                 "role": "system",
@@ -887,12 +941,13 @@ def llm_signal_prediction(
             },
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ],
-        model=model,
+        models=models,
     )
     try:
         parsed = json.loads(extract_json(raw))
     except Exception:
         parsed = {"raw_response": raw}
+    parsed["model_used"] = used_model
     return {"llm_signal_prediction_json": json.dumps(parsed, ensure_ascii=False)}
 
 
@@ -1085,7 +1140,7 @@ def enrich_one_video(
                 summary = summarize_frames_openrouter(
                     frames,
                     str(row.get("caption", "")),
-                    args.vision_model,
+                    args.vision_models,
                     args.max_vision_images,
                     rate_limiter=rate_limiter,
                 )
@@ -1145,7 +1200,7 @@ def run_llm_predictions(
     tracker.start_stage("llm", len(rows))
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         future_to_index = {
-            executor.submit(llm_signal_prediction, row, args.llm_model, api_rate_limiter): index
+            executor.submit(llm_signal_prediction, row, args.llm_models, api_rate_limiter): index
             for index, row in enumerate(rows)
         }
         for future in as_completed(future_to_index):
@@ -1302,7 +1357,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--faster-whisper-device", default="cpu", choices=["cpu", "cuda", "auto"])
     parser.add_argument("--whisper-model", default="whisper-1")
     parser.add_argument("--summarize-frames", action="store_true")
-    parser.add_argument("--vision-model", default="nvidia/nemotron-nano-12b-v2-vl:free")
+    parser.add_argument(
+        "--vision-model",
+        default=",".join(DEFAULT_VISION_MODELS),
+        help="Vision model or comma-separated fallback list for OpenRouter.",
+    )
     parser.add_argument("--frame-every-seconds", type=float, default=5.0)
     parser.add_argument(
         "--max-frames",
@@ -1317,9 +1376,16 @@ def parse_args() -> argparse.Namespace:
         help="Maximum frames sent together to the vision model. 0 means send all sampled frames.",
     )
     parser.add_argument("--predict-with-llm", action="store_true")
-    parser.add_argument("--llm-model", default="openai/gpt-oss-20b:free")
+    parser.add_argument(
+        "--llm-model",
+        default=",".join(DEFAULT_LLM_MODELS),
+        help="LLM model or comma-separated fallback list for OpenRouter.",
+    )
     parser.add_argument("--api-sleep", type=float, default=1.0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.vision_models = parse_model_list(args.vision_model, DEFAULT_VISION_MODELS)
+    args.llm_models = parse_model_list(args.llm_model, DEFAULT_LLM_MODELS)
+    return args
 
 
 def main() -> None:
